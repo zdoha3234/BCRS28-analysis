@@ -1,0 +1,380 @@
+---
+title: "BCRS-28 | Script 3: Spatial Transcriptomic Analysis"
+subtitle: "10x Visium — Tissue-Level BCRS-28 Signature Distribution"
+author: "Zinab O. Doha"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center"
+)
+```
+
+---
+
+## Overview
+
+This script maps the BCRS-28 signature onto 10x Visium spatial
+transcriptomic data from primary breast carcinoma tissue, including:
+
+- Data download from GEO (GSE203612, NYU_BRCA0 Visium)
+- BCRS-28 directional module score computation
+- Spatial visualization of signature enrichment
+- Spot-level classification (BCRS-28 High vs Low)
+- Figure 6 (spatial panels) generation
+
+**Dataset:** Barkley D, et al. Nat Genet. 2022;54(8):1192–1201.  
+doi:10.1038/s41588-022-01141-9
+
+**Input:** GSE203612 Visium files  
+**Output:** Figure 6 spatial panels
+
+> **Note on cell type deconvolution:** The publicly deposited Visium  
+> object contains only three metadata fields (orig.ident, nCount_Spatial,  
+> nFeature_Spatial). No spot-level cell type annotations were deposited  
+> in the public GEO release. Spot-level deconvolution using matched  
+> inDrop scRNA-seq data (NYU_BRCA1–3) as a reference is identified as  
+> a future analysis direction.
+
+---
+
+## Step 1 — Libraries
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(tidyverse)
+  library(patchwork)
+  library(ggplot2)
+  library(scales)
+})
+
+dir.create("figures/spatial", showWarnings=FALSE, recursive=TRUE)
+set.seed(42)
+
+# ── BCRS-28 Gene Lists (directional) ────────────────────────────────────────
+BCRS28_UP <- c(
+  "GADD45G", "CRIP1",   "SNCG",    "PIP",
+  "KRT14",   "KRT15",   "MUCL1",   "SERHL2",
+  "ANGPTL4", "BAMBI",   "CD14",    "CXCL14",
+  "KLK7",    "KLK5",    "RARRES1", "SLC40A1", "FABP3"
+)
+
+BCRS28_DOWN <- c(
+  "TGM2",    "HMOX1",   "SCGB3A1", "SERPINA5", "FASN",
+  "WNT4",    "LMO7",    "CCL20",   "EEF1A2",   "CCDC74A", "GBP1"
+)
+
+cat("BCRS-28 up genes:",   length(BCRS28_UP),   "\n")
+cat("BCRS-28 down genes:", length(BCRS28_DOWN), "\n")
+```
+
+---
+
+## Step 2 — Download Visium Data from GEO
+
+```{r download, eval=FALSE}
+# ── Download GSE203612 NYU_BRCA0 Visium sample ─────────────────────────────
+# GEO accession: GSE203612
+# Sample: GSM6177599 — NYU_BRCA0_Vis 10x Genomics Visium
+# Reference: Barkley et al., Nat Genet 2022
+
+spatial_dir <- "data/raw/spatial/GSE203612"
+spatial_sub <- file.path(spatial_dir, "spatial")
+dir.create(spatial_sub, showWarnings=FALSE, recursive=TRUE)
+
+base_url <- "https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM6177nnn/GSM6177599/suppl/"
+
+# Expression matrix
+download.file(
+  paste0(base_url, "GSM6177599_NYU_BRCA0_Vis_processed_filtered_feature_bc_matrix.h5.gz"),
+  destfile = file.path(spatial_dir, "filtered_feature_bc_matrix.h5.gz"),
+  mode = "wb"
+)
+R.utils::gunzip(file.path(spatial_dir, "filtered_feature_bc_matrix.h5.gz"),
+                remove=FALSE)
+
+# Spatial files
+spatial_files <- list(
+  list(src="GSM6177599_NYU_BRCA0_Vis_processed_spatial_tissue_positions_list.csv.gz",
+       dest="tissue_positions_list.csv"),
+  list(src="GSM6177599_NYU_BRCA0_Vis_processed_spatial_scalefactors_json.json.gz",
+       dest="scalefactors_json.json"),
+  list(src="GSM6177599_NYU_BRCA0_Vis_processed_spatial_tissue_hires_image.png.gz",
+       dest="tissue_hires_image.png"),
+  list(src="GSM6177599_NYU_BRCA0_Vis_processed_spatial_tissue_lowres_image.png.gz",
+       dest="tissue_lowres_image.png")
+)
+
+for (f in spatial_files) {
+  src  <- file.path(spatial_dir, f$src)
+  dest <- file.path(spatial_sub, f$dest)
+  download.file(paste0(base_url, f$src), destfile=src, mode="wb")
+  R.utils::gunzip(src, destfile=dest, remove=FALSE)
+  cat("✓ Processed:", f$dest, "\n")
+}
+cat("Download complete.\n")
+```
+
+---
+
+## Step 3 — Load Visium Object
+
+```{r load-visium}
+spatial_dir <- "data/raw/spatial/GSE203612"
+
+cat("Loading Visium data...\n")
+sp_seu <- Load10X_Spatial(
+  data.dir   = spatial_dir,
+  filename   = "filtered_feature_bc_matrix.h5",
+  assay      = "Spatial",
+  slice      = "NYU_BRCA0"
+)
+
+cat("Spots:", ncol(sp_seu), "\n")
+cat("Genes:", nrow(sp_seu), "\n")
+
+# Check available metadata
+cat("\nMetadata columns:\n")
+print(names(sp_seu@meta.data))
+
+# Note: Only orig.ident, nCount_Spatial, nFeature_Spatial available
+# No spot-level cell type annotations in public deposit
+```
+
+---
+
+## Step 4 — Normalize & Check BCRS-28 Gene Availability
+
+```{r normalize}
+sp_seu <- NormalizeData(sp_seu, verbose=FALSE)
+
+# Check BCRS-28 gene availability
+up_found   <- intersect(BCRS28_UP,   rownames(sp_seu))
+down_found <- intersect(BCRS28_DOWN, rownames(sp_seu))
+
+cat("Up genes found:",   length(up_found),   "/", length(BCRS28_UP),   "\n")
+cat("Down genes found:", length(down_found), "/", length(BCRS28_DOWN), "\n")
+cat("Missing up:  ",   setdiff(BCRS28_UP,   rownames(sp_seu)), "\n")
+cat("Missing down:", setdiff(BCRS28_DOWN, rownames(sp_seu)), "\n")
+```
+
+---
+
+## Step 5 — Compute Directional BCRS-28 Module Score
+
+```{r module-score}
+# ── Compute separate up and down scores ────────────────────────────────────
+sp_seu <- AddModuleScore(sp_seu,
+                          features = list(up_found),
+                          name     = "BCRS28_Up",
+                          seed     = 42)
+
+sp_seu <- AddModuleScore(sp_seu,
+                          features = list(down_found),
+                          name     = "BCRS28_Down",
+                          seed     = 42)
+
+# ── Combined directional score: up - down ──────────────────────────────────
+# High score = up genes high + down genes low = BRCA1-loss pattern
+sp_seu$BCRS28_Score <- sp_seu$BCRS28_Up1 - sp_seu$BCRS28_Down1
+
+cat("BCRS-28 score summary:\n")
+print(summary(sp_seu$BCRS28_Score))
+
+# ── Classify spots: High vs Low (split by mean) ───────────────────────────
+mean_score <- mean(sp_seu$BCRS28_Score, na.rm=TRUE)
+sp_seu$BCRS28_Group <- ifelse(sp_seu$BCRS28_Score >= mean_score,
+                               "BCRS-28 High", "BCRS-28 Low")
+
+pct_high <- round(mean(sp_seu$BCRS28_Group == "BCRS-28 High")*100, 1)
+cat("\nBCRS-28 High spots:", pct_high, "%\n")
+cat("BCRS-28 Low spots: ", 100-pct_high, "%\n")
+print(table(sp_seu$BCRS28_Group))
+```
+
+---
+
+## Step 6 — Figure 6: Spatial Visualization {.tabset}
+
+### Panel A — Continuous BCRS-28 Score
+
+```{r fig6a, fig.width=8, fig.height=7}
+fig6A <- SpatialFeaturePlot(
+  sp_seu,
+  features    = "BCRS28_Score",
+  pt.size.factor = 1.3,
+  alpha       = c(0.3, 1)
+) +
+  scale_fill_gradient2(
+    low      = "#2ABAB4",
+    mid      = "white",
+    high     = "#E41A1C",
+    midpoint = 0,
+    name     = "BCRS-28\nScore"
+  ) +
+  labs(title = "A  BCRS-28 Signature Score\n(NYU Breast Carcinoma — 10x Visium)") +
+  theme(plot.title = element_text(face="bold", hjust=0.5, size=12))
+
+fig6A
+```
+
+### Panel B — High vs Low Classification
+
+```{r fig6b, fig.width=8, fig.height=7}
+fig6B <- SpatialDimPlot(
+  sp_seu,
+  group.by       = "BCRS28_Group",
+  pt.size.factor = 1.3,
+  alpha          = c(0.3, 1)
+) +
+  scale_fill_manual(
+    values = c("BCRS-28 High" = "#E41A1C",
+               "BCRS-28 Low"  = "#2ABAB4"),
+    name   = NULL
+  ) +
+  labs(title = paste0("B  BCRS-28 High vs Low\n(",
+                      pct_high, "% spots BCRS-28 High)")) +
+  theme(plot.title=element_text(face="bold",hjust=0.5,size=12))
+
+fig6B
+```
+
+### Panel C — Score Distribution
+
+```{r fig6c, fig.width=7, fig.height=5}
+score_df <- data.frame(
+  Score = sp_seu$BCRS28_Score,
+  Group = sp_seu$BCRS28_Group
+)
+
+wt <- wilcox.test(Score ~ Group, data=score_df)
+plab <- ifelse(wt$p.value < 0.001, "p < 0.001",
+               paste0("p = ", round(wt$p.value, 4)))
+
+fig6C <- ggplot(score_df, aes(x=Group, y=Score, fill=Group)) +
+  geom_boxplot(width=0.5, outlier.size=0.5, alpha=0.8) +
+  geom_jitter(aes(colour=Group), width=0.1, size=0.3, alpha=0.3) +
+  annotate("text", x=1.5, y=max(score_df$Score)*1.05,
+           label=plab, size=4, fontface="bold") +
+  annotate("segment", x=1, xend=2,
+           y=max(score_df$Score)*1.02, yend=max(score_df$Score)*1.02) +
+  scale_fill_manual(values=c("BCRS-28 High"="#E41A1C",
+                               "BCRS-28 Low"="#2ABAB4")) +
+  scale_colour_manual(values=c("BCRS-28 High"="#E41A1C",
+                                 "BCRS-28 Low"="#2ABAB4")) +
+  labs(title = "C  BCRS-28 Score Distribution",
+       x = NULL, y = "BCRS-28 Score") +
+  theme_classic(base_size=12) +
+  theme(plot.title=element_text(face="bold",hjust=0.5),
+        legend.position="none")
+
+fig6C
+```
+
+### Compose & Save
+
+```{r fig6-save, fig.width=18, fig.height=7}
+fig6 <- (fig6A | fig6B | fig6C) +
+  plot_annotation(
+    title    = "Figure 6 · Spatial Distribution of BCRS-28 in Primary Breast Carcinoma",
+    subtitle = paste0("10x Visium | NYU_BRCA0 | n = ",
+                      ncol(sp_seu), " spots | ",
+                      pct_high, "% BCRS-28 High"),
+    theme    = theme(
+      plot.title    = element_text(size=14, face="bold", hjust=0.5),
+      plot.subtitle = element_text(size=11, colour="grey40", hjust=0.5)
+    )
+  )
+
+fig6
+
+ggsave("figures/spatial/Figure6_BCRS28_Spatial.png",
+       fig6, width=18, height=7, dpi=300)
+ggsave("figures/spatial/Figure6_BCRS28_Spatial.pdf",
+       fig6, width=18, height=7)
+cat("Figure 6 saved.\n")
+```
+
+---
+
+## Step 7 — Individual Gene Spatial Maps (Key BCRS-28 Genes)
+
+```{r gene-maps, fig.width=14, fig.height=6}
+key_genes <- c("CRIP1", "BAMBI", "GADD45G", "ANGPTL4",
+               "TGM2",  "HMOX1", "SCGB3A1", "GBP1")
+key_genes <- intersect(key_genes, rownames(sp_seu))
+
+p_genes <- SpatialFeaturePlot(
+  sp_seu,
+  features       = key_genes,
+  pt.size.factor = 1.2,
+  alpha          = c(0.1, 1),
+  ncol           = 4
+)
+
+p_genes
+ggsave("figures/spatial/FigureS_BCRS28_KeyGenes_Spatial.png",
+       p_genes, width=16, height=8, dpi=300)
+cat("Key gene spatial maps saved.\n")
+```
+
+---
+
+## Step 8 — Spot-Level Statistics Summary
+
+```{r stats-summary}
+# Summary statistics
+spot_summary <- data.frame(
+  Metric = c(
+    "Total spots",
+    "BCRS-28 High spots (n)",
+    "BCRS-28 High spots (%)",
+    "BCRS-28 Low spots (n)",
+    "BCRS-28 Low spots (%)",
+    "Mean BCRS-28 score (High)",
+    "Mean BCRS-28 score (Low)",
+    "Up genes found in Visium",
+    "Down genes found in Visium"
+  ),
+  Value = c(
+    ncol(sp_seu),
+    sum(sp_seu$BCRS28_Group=="BCRS-28 High"),
+    paste0(pct_high, "%"),
+    sum(sp_seu$BCRS28_Group=="BCRS-28 Low"),
+    paste0(100-pct_high, "%"),
+    round(mean(score_df$Score[score_df$Group=="BCRS-28 High"]), 3),
+    round(mean(score_df$Score[score_df$Group=="BCRS-28 Low"]),  3),
+    paste0(length(up_found),   " / ", length(BCRS28_UP)),
+    paste0(length(down_found), " / ", length(BCRS28_DOWN))
+  )
+)
+
+print(spot_summary)
+write.csv(spot_summary,
+          "supplementary/TableS_Spatial_Summary.csv",
+          row.names=FALSE)
+cat("✓ Spatial summary saved.\n")
+```
+
+---
+
+## Session Info
+
+```{r session}
+sessionInfo()
+```

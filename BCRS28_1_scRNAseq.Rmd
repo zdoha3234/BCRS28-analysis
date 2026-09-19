@@ -1,0 +1,724 @@
+---
+title: "BCRS-28 | Script 1: scRNA-seq Analysis"
+subtitle: "Cell Annotation, Differential Expression & Pathway Enrichment"
+author: "Zinab O. Doha"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center"
+)
+```
+
+---
+
+## Overview
+
+This script performs single-cell RNA sequencing analysis of BRCA1-mutant
+versus wild-type normal breast epithelium, including:
+
+- Quality control and normalization
+- Dimensionality reduction and clustering
+- Cell type annotation using canonical markers
+- Epithelial subset differential expression (BRCA1 vs WT)
+- Pathway enrichment analysis (GO, KEGG, GSEA Hallmark)
+- Figure 1 (cell atlas) and Figure 2 (epithelial DE) generation
+
+**Input:** `seu_wt_brca1_with_metadata.rds`  
+**Output:** Figures 1–2, Supplementary Tables S1–S4
+
+---
+
+## Step 1 — Libraries
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(tidyverse)
+  library(patchwork)
+  library(pheatmap)
+  library(ggrepel)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(enrichplot)
+  library(msigdbr)
+  library(openxlsx)
+  library(DESeq2)
+  library(tibble)
+  library(dplyr)
+})
+
+dir.create("figures",       showWarnings = FALSE)
+dir.create("supplementary", showWarnings = FALSE)
+set.seed(42)
+
+# ── Color palette ────────────────────────────────────────────────────────────
+COL_BRCA1 <- "#E41A1C"   # Red
+COL_WT    <- "#2ABAB4"   # Teal
+
+cat("Libraries loaded.\n")
+```
+
+---
+
+## Step 2 — Load & Inspect Object
+
+```{r load}
+seu <- readRDS("seu_wt_brca1_with_metadata.rds")
+
+cat("=== Object summary ===\n")
+print(seu)
+cat("\nGenotype counts:\n")
+print(table(seu$genotype))
+cat("\nCell type counts:\n")
+print(table(seu$CellType))
+```
+
+---
+
+## Step 3 — Normalize & Dimensionality Reduction
+
+```{r reprocess}
+DefaultAssay(seu) <- "RNA"
+
+seu <- NormalizeData(seu, normalization.method = "LogNormalize",
+                     scale.factor = 10000, verbose = FALSE)
+seu <- FindVariableFeatures(seu, selection.method = "vst",
+                             nfeatures = 3000, verbose = FALSE)
+seu <- ScaleData(seu, features = VariableFeatures(seu), verbose = FALSE)
+gc()
+
+seu <- RunPCA(seu,         npcs = 30,       verbose = FALSE)
+seu <- FindNeighbors(seu,  dims = 1:20,     verbose = FALSE)
+seu <- FindClusters(seu,   resolution = 0.25, verbose = FALSE)
+seu <- RunUMAP(seu,        dims = 1:20, seed.use = 42, verbose = FALSE)
+
+cat("Clusters found:", length(unique(seu$seurat_clusters)), "\n")
+```
+
+---
+
+## Step 4 — Cell Type Annotation {.tabset}
+
+### Canonical Marker Dotplot
+
+```{r canonical-markers, fig.width=14, fig.height=6}
+canonical_markers <- intersect(
+  c("PTPRC", "CD79A", "MS4A1",
+    "CD14",  "CD68",  "LYZ",
+    "CD3D",  "CD3E",  "CD8A",
+    "EPCAM", "KRT8",  "KRT18",
+    "COL1A1","FAP",
+    "PECAM1","CDH5",  "CLDN5"),
+  rownames(seu)
+)
+
+Idents(seu) <- "seurat_clusters"
+
+DotPlot(seu,
+        features  = canonical_markers,
+        dot.scale = 6,
+        col.min   = 0) +
+  scale_colour_gradient2(low="white", mid="#FB9A99",
+                         high="#E31A1C", midpoint=1) +
+  theme(axis.text.x = element_text(angle=45, hjust=1, size=10)) +
+  labs(title="Canonical markers per cluster")
+```
+
+### Cluster Assignment
+
+```{r annotation}
+cluster_to_celltype <- c(
+  "0"  = "Epithelial", "1"  = "Fibroblast",  "2"  = "Endothelial",
+  "3"  = "Epithelial", "4"  = "Epithelial",  "5"  = "Epithelial",
+  "6"  = "Epithelial", "7"  = "Epithelial",  "8"  = "Epithelial",
+  "9"  = "T_cells",    "10" = "Myeloid",      "11" = "Epithelial",
+  "12" = "Epithelial", "13" = "Myeloid",      "14" = "B_cells",
+  "15" = "Epithelial", "16" = "Endothelial"
+)
+
+ct_vec        <- cluster_to_celltype[as.character(seu$seurat_clusters)]
+names(ct_vec) <- colnames(seu)
+seu           <- AddMetaData(seu, metadata = ct_vec,
+                              col.name = "CellType_manual")
+
+broad_vec <- case_when(
+  ct_vec %in% c("T_cells","Myeloid","B_cells") ~ "Immune",
+  ct_vec == "Epithelial"                        ~ "Epithelial",
+  ct_vec %in% c("Fibroblast","Endothelial")     ~ "Stromal"
+)
+names(broad_vec) <- colnames(seu)
+seu <- AddMetaData(seu, metadata = broad_vec, col.name = "BroadType")
+
+cat("Cell type distribution:\n")
+print(table(seu$CellType_manual))
+cat("\nGenotype x CellType:\n")
+print(table(seu$genotype, seu$CellType_manual))
+```
+
+---
+
+## Step 5 — Figure 1: Single-Cell Atlas {.tabset}
+
+### Panel A — Clusters
+
+```{r fig1a}
+fig1A <- DimPlot(seu, group.by="seurat_clusters",
+                 label=TRUE, pt.size=0.3) +
+  NoLegend() + labs(title="Unsupervised clusters")
+fig1A
+```
+
+### Panel B — Cell Types
+
+```{r fig1b}
+fig1B <- DimPlot(seu, group.by="CellType_manual",
+                 label=TRUE, repel=TRUE, pt.size=0.3) +
+  NoLegend() + labs(title="Cell type annotation")
+fig1B
+```
+
+### Panel C — Donor
+
+```{r fig1c}
+fig1C <- DimPlot(seu, group.by="orig.ident", pt.size=0.3) +
+  labs(title="Sample / donor")
+fig1C
+```
+
+### Panel D — Marker Dotplot
+
+```{r fig1d, fig.width=12, fig.height=5}
+Idents(seu) <- "CellType_manual"
+markers_dot <- intersect(
+  c("PTPRC","CD79A","MS4A1","CD14","CD68","LYZ",
+    "CD3D","CD3E","CD8A","EPCAM","KRT8","KRT18",
+    "COL1A1","FAP","PECAM1","CDH5","CLDN5"),
+  rownames(seu)
+)
+
+fig1D <- DotPlot(seu, features=markers_dot, dot.scale=6, col.min=0) +
+  scale_colour_gradient2(low="white", mid="#FB9A99",
+                         high="#E31A1C", midpoint=1) +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) +
+  labs(title="Canonical markers", x=NULL, y=NULL)
+fig1D
+```
+
+### Compose & Save
+
+```{r fig1-save, fig.width=18, fig.height=13}
+fig1_final <- ((fig1A | fig1B | fig1C) +
+                 plot_layout(widths=c(1,1,1.15))) /
+              fig1D +
+  plot_layout(heights=c(1.2,1)) +
+  plot_annotation(
+    title    = "Figure 1 · scRNA-seq Landscape of BRCA1 vs WT Breast Tissue",
+    subtitle = paste0(ncol(seu), " cells | Unsupervised clustering + manual annotation"),
+    theme    = theme(
+      plot.title    = element_text(size=16, face="bold", hjust=0.5),
+      plot.subtitle = element_text(size=12, colour="grey40", hjust=0.5)
+    )
+  )
+
+fig1_final
+
+ggsave("figures/Figure1_atlas.png",  fig1_final,
+       width=18, height=13, dpi=300)
+ggsave("figures/Figure1_atlas.pdf",  fig1_final,
+       width=18, height=13)
+cat("Figure 1 saved.\n")
+```
+
+---
+
+## Step 6 — Subset Epithelial Cells
+
+```{r subset-epi}
+seu_epi <- subset(seu, subset = BroadType == "Epithelial")
+seu_epi$genotype <- factor(seu_epi$genotype, levels=c("WT","BRCA1"))
+
+cat("Epithelial cells:", ncol(seu_epi), "\n")
+print(table(seu_epi$genotype))
+
+DefaultAssay(seu_epi) <- "RNA"
+seu_epi <- NormalizeData(seu_epi, verbose=FALSE)
+seu_epi <- FindVariableFeatures(seu_epi, nfeatures=3000, verbose=FALSE)
+seu_epi <- ScaleData(seu_epi,
+                     features=VariableFeatures(seu_epi), verbose=FALSE)
+gc()
+seu_epi <- RunPCA(seu_epi,       npcs=30,         verbose=FALSE)
+seu_epi <- FindNeighbors(seu_epi, dims=1:20,      verbose=FALSE)
+seu_epi <- FindClusters(seu_epi,  resolution=0.4, verbose=FALSE)
+seu_epi <- RunUMAP(seu_epi,       dims=1:20, seed.use=42, verbose=FALSE)
+
+cat("Epithelial subset processed.\n")
+```
+
+---
+
+## Step 7 — Differential Expression (BRCA1 vs WT) {.tabset}
+
+### Run FindMarkers
+
+```{r de-analysis}
+Idents(seu_epi) <- "genotype"
+
+de_results <- FindMarkers(
+  seu_epi,
+  ident.1         = "BRCA1",
+  ident.2         = "WT",
+  test.use        = "wilcox",
+  min.pct         = 0.1,
+  logfc.threshold = 0.1,
+  verbose         = FALSE
+) %>%
+  rownames_to_column("gene") %>%
+  rename(log2FoldChange = avg_log2FC,
+         padj           = p_val_adj,
+         pvalue         = p_val) %>%
+  arrange(padj, desc(abs(log2FoldChange)))
+
+cat("Up in BRCA1 (FDR<0.05, |LFC|>0.5):",
+    sum(de_results$padj < 0.05 & de_results$log2FoldChange > 0.5), "\n")
+cat("Down in BRCA1:",
+    sum(de_results$padj < 0.05 & de_results$log2FoldChange < -0.5), "\n")
+```
+
+### Pseudobulk Validation (DESeq2)
+
+```{r pseudobulk}
+# ── Defined per reviewer comment 2 ──────────────────────────────────────────
+DONOR_COL    <- "donor_id"
+GENOTYPE_COL <- "genotype"
+
+BCRS28_genes <- c(
+  "GADD45G",
+  "CRIP1",   "SNCG",    "PIP",
+  "KRT14",   "KRT15",   "MUCL1",   "SERHL2",
+  "ANGPTL4", "BAMBI",   "CD14",    "CXCL14",
+  "KLK7",    "KLK5",    "RARRES1", "SLC40A1", "FABP3",
+  "TGM2",    "HMOX1",   "SCGB3A1", "SERPINA5","FASN",
+  "WNT4",    "LMO7",    "CCL20",   "EEF1A2",  "CCDC74A", "GBP1"
+)
+
+# Aggregate counts per donor
+DefaultAssay(seu_epi) <- "RNA"
+counts    <- GetAssayData(seu_epi, layer="counts")
+meta_epi  <- seu_epi@meta.data
+donors    <- unique(meta_epi[[DONOR_COL]])
+
+pb_counts <- sapply(donors, function(d) {
+  cells <- rownames(meta_epi)[meta_epi[[DONOR_COL]] == d]
+  if (length(cells)==1) as.numeric(counts[,cells])
+  else                   rowSums(counts[,cells])
+})
+pb_counts           <- as.matrix(pb_counts)
+colnames(pb_counts) <- donors
+rownames(pb_counts) <- rownames(counts)
+
+# Filter low counts
+keep      <- rowSums(pb_counts >= 10) >= 2
+pb_counts <- pb_counts[keep,]
+
+# Build coldata
+coldata <- meta_epi %>%
+  dplyr::select(all_of(c(DONOR_COL, GENOTYPE_COL))) %>%
+  distinct()
+rownames(coldata) <- coldata[[DONOR_COL]]
+coldata[[DONOR_COL]] <- NULL
+coldata <- coldata[colnames(pb_counts),,drop=FALSE]
+coldata[[GENOTYPE_COL]] <- factor(coldata[[GENOTYPE_COL]],
+                                   levels=c("WT","BRCA1"))
+
+# DESeq2
+dds <- DESeqDataSetFromMatrix(
+  countData = pb_counts,
+  colData   = coldata,
+  design    = ~ genotype
+)
+dds <- DESeq(dds)
+res <- results(dds, contrast=c("genotype","BRCA1","WT"), alpha=0.05)
+
+cat("\nPseudobulk DESeq2 summary:\n")
+summary(res)
+
+# BCRS-28 pseudobulk results
+res_pb <- as.data.frame(res) %>%
+  rownames_to_column("gene") %>%
+  filter(gene %in% BCRS28_genes) %>%
+  dplyr::select(gene, log2FoldChange, pvalue, padj) %>%
+  mutate(
+    log2FoldChange = round(log2FoldChange, 3),
+    padj           = signif(padj, 3),
+    Direction      = ifelse(log2FoldChange > 0, "UP", "DOWN"),
+    Significant    = ifelse(!is.na(padj) & padj < 0.05, "YES", "NO")
+  ) %>%
+  arrange(padj)
+
+cat("\nBCRS-28 pseudobulk results:\n")
+print(res_pb)
+
+write.csv(res_pb, "supplementary/TableS7_BCRS28_Pseudobulk.csv",
+          row.names=FALSE)
+cat("✓ Table S7 saved.\n")
+```
+
+### Donor Consistency
+
+```{r donor-consistency}
+bcrs_present <- BCRS28_genes[BCRS28_genes %in% rownames(seu_epi)]
+
+expr_data <- GetAssayData(seu_epi, assay="RNA", layer="data")
+expr_bcrs <- expr_data[bcrs_present,]
+
+donor_expr <- sapply(donors, function(d) {
+  cells <- rownames(meta_epi)[meta_epi[[DONOR_COL]] == d]
+  if (length(cells)==1) as.numeric(expr_bcrs[,cells])
+  else                   rowMeans(expr_bcrs[,cells])
+})
+donor_expr           <- as.data.frame(donor_expr)
+colnames(donor_expr) <- donors
+rownames(donor_expr) <- bcrs_present
+
+# Annotation
+col_annot <- meta_epi %>%
+  dplyr::select(all_of(c(DONOR_COL, GENOTYPE_COL))) %>%
+  distinct()
+rownames(col_annot) <- col_annot[[DONOR_COL]]
+col_annot[[DONOR_COL]] <- NULL
+col_annot <- col_annot[colnames(donor_expr),,drop=FALSE]
+colnames(col_annot) <- "Genotype"
+
+# Heatmap
+pheatmap(
+  donor_expr,
+  annotation_col    = col_annot,
+  annotation_colors = list(Genotype=c(BRCA1=COL_BRCA1, WT=COL_WT)),
+  cluster_rows      = TRUE,
+  cluster_cols      = TRUE,
+  scale             = "row",
+  color             = colorRampPalette(c(COL_WT,"white",COL_BRCA1))(100),
+  fontsize_row      = 9,
+  fontsize_col      = 8,
+  main              = "BCRS-28 Expression Across Individual Donors\n(Supplementary Figure S1D)",
+  border_color      = NA,
+  filename          = "figures/FigS1D_BCRS28_Donor_Heatmap.png",
+  width=9, height=8
+)
+cat("✓ Figure S1D saved.\n")
+
+# Consistency table
+brca1_donors <- rownames(col_annot)[col_annot$Genotype == "BRCA1"]
+wt_donors    <- rownames(col_annot)[col_annot$Genotype == "WT"]
+
+consistency_df <- lapply(bcrs_present, function(g) {
+  b_vals  <- as.numeric(donor_expr[g, brca1_donors])
+  wt_mean <- mean(as.numeric(donor_expr[g, wt_donors]), na.rm=TRUE)
+  b_mean  <- mean(b_vals, na.rm=TRUE)
+  pct     <- round(mean(b_vals > wt_mean, na.rm=TRUE)*100, 1)
+  data.frame(
+    Gene                  = g,
+    Direction             = ifelse(b_mean > wt_mean, "UP", "DOWN"),
+    Pct_Donors_Consistent = pct,
+    BRCA1_Mean            = round(b_mean,   3),
+    WT_Mean               = round(wt_mean,  3)
+  )
+}) %>% bind_rows() %>% arrange(desc(Pct_Donors_Consistent))
+
+print(consistency_df)
+write.csv(consistency_df,
+          "supplementary/TableS8_Donor_Consistency.csv",
+          row.names=FALSE)
+cat("✓ Table S8 saved.\n")
+```
+
+---
+
+## Step 8 — Figure 2: Epithelial DE Visualization {.tabset}
+
+### Panel A — UMAP by Genotype
+
+```{r fig2a}
+fig2A <- DimPlot(seu_epi,
+                 group.by = "genotype",
+                 cols     = c(BRCA1=COL_BRCA1, WT=COL_WT),
+                 pt.size  = 0.5) +
+  labs(title = "Epithelial cells by genotype")
+fig2A
+```
+
+### Panel B — Volcano Plot
+
+```{r fig2b, fig.width=9, fig.height=7}
+LFC_THRESH <- 0.5
+P_THRESH   <- 0.05
+
+top_up   <- de_results %>%
+  filter(padj<P_THRESH, log2FoldChange>LFC_THRESH) %>%
+  slice_max(log2FoldChange, n=15) %>% pull(gene)
+top_down <- de_results %>%
+  filter(padj<P_THRESH, log2FoldChange< -LFC_THRESH) %>%
+  slice_min(log2FoldChange, n=15) %>% pull(gene)
+
+vol_df <- de_results %>%
+  mutate(
+    sig = case_when(
+      padj < P_THRESH & log2FoldChange >  LFC_THRESH ~ "Up in BRCA1",
+      padj < P_THRESH & log2FoldChange < -LFC_THRESH ~ "Down in BRCA1",
+      TRUE ~ "NS"
+    ),
+    label = case_when(
+      gene %in% top_up   ~ gene,
+      gene %in% top_down ~ gene,
+      TRUE ~ NA_character_
+    )
+  )
+
+n_up   <- sum(vol_df$sig=="Up in BRCA1")
+n_down <- sum(vol_df$sig=="Down in BRCA1")
+n_ns   <- sum(vol_df$sig=="NS")
+
+fig2B <- ggplot(vol_df, aes(x=log2FoldChange,
+                              y=-log10(pvalue+1e-300),
+                              colour=sig)) +
+  geom_point(size=0.8, alpha=0.6) +
+  geom_text_repel(aes(label=label), size=4, fontface="italic",
+                  na.rm=TRUE, max.overlaps=20, colour="black") +
+  geom_vline(xintercept=c(-LFC_THRESH, LFC_THRESH),
+             linetype="dashed", colour="grey40") +
+  geom_hline(yintercept=-log10(P_THRESH),
+             linetype="dashed", colour="grey40") +
+  scale_colour_manual(
+    values = c("Up in BRCA1"=COL_BRCA1, "Down in BRCA1"=COL_WT,
+               "NS"="grey75"),
+    labels = c(paste0("Up in BRCA1 (n=",   n_up,   ")"),
+               paste0("Down in BRCA1 (n=", n_down, ")"),
+               paste0("NS (n=",            n_ns,   ")")),
+    name   = NULL
+  ) +
+  labs(title    = "Differential Expression — BRCA1 vs WT Epithelial Cells",
+       subtitle = paste0("scRNA-seq | Wilcoxon test | FC threshold = ",
+                         LFC_THRESH, " | FDR < ", P_THRESH),
+       x = "log\u2082 Fold Change (BRCA1 / WT)",
+       y = expression(-log[10](p~value))) +
+  theme_classic(base_size=12) +
+  theme(plot.title    = element_text(face="bold", hjust=0.5),
+        plot.subtitle = element_text(hjust=0.5, colour="grey50"),
+        legend.position = "top")
+
+fig2B
+ggsave("figures/Figure2B_volcano.png", fig2B, width=9, height=7, dpi=300)
+cat("Figure 2B saved.\n")
+```
+
+### Panel C — Heatmap
+
+```{r fig2c, fig.width=10, fig.height=8}
+# Gene lists from verified supplementary table
+top_up_hm <- c("SLC40A1","FABP3","CRIP1","SERHL2","RARRES1","CAVIN3",
+                "CD14","KLK7","BAMBI","KRT14","PIP","GADD45G","KLK5",
+                "MUCL1","SNCG","ANGPTL4","KRT15","CXCL14","ZBTB16",
+                "RGS2","ADRB2","DNAJB1","PEG10","SETD9","TOB1")
+top_dn_hm <- c("IGHA2","TGM2","WNT4","SCGB3A1","LMO7","CCL20","EEF1A2",
+               "SERPINA5","ZNF385C","FASN","HMOX1","CCDC74A","GBP1",
+               "CTXN1","MYEOV","AP000851.1","SDCBP2","MMP7","SLC7A2",
+               "PRKAA2","SYT7","OPN3","BATF","RAB31","TRIO")
+
+top_up_hm <- intersect(top_up_hm, rownames(seu_epi))
+top_dn_hm <- intersect(top_dn_hm, rownames(seu_epi))
+hm_genes  <- c(top_up_hm, top_dn_hm)
+
+set.seed(42)
+c_brca <- sample(WhichCells(seu_epi, expression = genotype=="BRCA1"),
+                 min(15000, sum(seu_epi$genotype=="BRCA1")))
+c_wt   <- sample(WhichCells(seu_epi, expression = genotype=="WT"),
+                 min(15000, sum(seu_epi$genotype=="WT")))
+cells_ord <- c(c_brca, c_wt)
+
+seu_sub <- seu_epi[hm_genes, cells_ord]
+seu_sub <- ScaleData(seu_sub, features=hm_genes, verbose=FALSE)
+expr_hm <- as.matrix(GetAssayData(seu_sub, layer="scale.data")[hm_genes,])
+expr_hm <- pmin(pmax(expr_hm, -2), 2)
+
+ann_col <- data.frame(
+  Genotype  = factor(seu_epi$genotype[cells_ord], levels=c("BRCA1","WT")),
+  row.names = cells_ord
+)
+ann_colors <- list(Genotype=c(BRCA1=COL_BRCA1, WT=COL_WT))
+
+png("figures/Figure2C_heatmap.png", width=10, height=8,
+    units="in", res=300)
+pheatmap(expr_hm,
+         color             = colorRampPalette(c("#4575B4","white","#D73027"))(200),
+         breaks            = seq(-2, 2, length.out=201),
+         cluster_rows      = FALSE,
+         cluster_cols      = FALSE,
+         show_colnames     = FALSE,
+         show_rownames     = TRUE,
+         fontsize_row      = 8,
+         annotation_col    = ann_col,
+         annotation_colors = ann_colors,
+         gaps_col          = length(c_brca),
+         gaps_row          = length(top_up_hm),
+         main              = "Top 25 up & down — BRCA1 vs WT",
+         border_color      = NA,
+         treeheight_col    = 0,
+         treeheight_row    = 0)
+dev.off()
+cat("Figure 2C saved.\n")
+```
+
+---
+
+## Step 9 — Pathway Enrichment {.tabset}
+
+### GO Enrichment (Up genes)
+
+```{r go-up}
+up_genes   <- de_results %>%
+  filter(padj<0.05, log2FoldChange>0) %>% pull(gene)
+up_entrez  <- bitr(up_genes, "SYMBOL","ENTREZID", org.Hs.eg.db)
+
+go_up <- enrichGO(gene          = up_entrez$ENTREZID,
+                  OrgDb         = org.Hs.eg.db,
+                  ont           = "BP",
+                  pAdjustMethod = "BH",
+                  pvalueCutoff  = 0.05,
+                  readable      = TRUE)
+
+dotplot(go_up, showCategory=15,
+        title="GO BP — Up-regulated in BRCA1") +
+  theme(plot.title=element_text(face="bold", hjust=0.5))
+
+write.csv(as.data.frame(go_up),
+          "supplementary/TableS_GO_UP_BRCA1.csv", row.names=FALSE)
+```
+
+### GO Enrichment (Down genes)
+
+```{r go-down}
+dn_genes  <- de_results %>%
+  filter(padj<0.05, log2FoldChange<0) %>% pull(gene)
+dn_entrez <- bitr(dn_genes, "SYMBOL","ENTREZID", org.Hs.eg.db)
+
+go_dn <- enrichGO(gene          = dn_entrez$ENTREZID,
+                  OrgDb         = org.Hs.eg.db,
+                  ont           = "BP",
+                  pAdjustMethod = "BH",
+                  pvalueCutoff  = 0.05,
+                  readable      = TRUE)
+
+dotplot(go_dn, showCategory=15,
+        title="GO BP — Down-regulated in BRCA1") +
+  theme(plot.title=element_text(face="bold", hjust=0.5))
+
+write.csv(as.data.frame(go_dn),
+          "supplementary/TableS_GO_DOWN_BRCA1.csv", row.names=FALSE)
+```
+
+### GSEA Hallmark
+
+```{r gsea}
+ranked_vec <- setNames(
+  sign(de_results$log2FoldChange) * (-log10(de_results$pvalue+1e-300)),
+  de_results$gene
+)
+ranked_vec <- sort(ranked_vec, decreasing=TRUE)
+ranked_vec <- ranked_vec[!duplicated(names(ranked_vec))]
+
+gene_map   <- bitr(names(ranked_vec), "SYMBOL","ENTREZID", org.Hs.eg.db)
+ranked_e   <- ranked_vec[gene_map$SYMBOL]
+names(ranked_e) <- gene_map$ENTREZID
+ranked_e   <- sort(ranked_e[!duplicated(names(ranked_e))], decreasing=TRUE)
+
+h_sets <- msigdbr(species="Homo sapiens", category="H") %>%
+  dplyr::select(gs_name, entrez_gene) %>%
+  mutate(entrez_gene=as.character(entrez_gene))
+
+gsea_h <- GSEA(ranked_e,
+               TERM2GENE     = h_sets,
+               minGSSize     = 15,
+               pvalueCutoff  = 0.05,
+               pAdjustMethod = "BH",
+               seed          = TRUE,
+               eps           = 0,
+               verbose       = FALSE)
+
+cat("Significant Hallmark pathways:", nrow(as.data.frame(gsea_h)), "\n")
+
+gsea_df <- as.data.frame(gsea_h) %>%
+  mutate(
+    pathway   = gsub("HALLMARK_","",ID) %>%
+                gsub("_"," ",.) %>% str_to_title() %>% str_wrap(35),
+    direction = ifelse(NES>0, "Up in BRCA1", "Down in BRCA1")
+  ) %>%
+  arrange(NES) %>%
+  mutate(pathway=factor(pathway, levels=pathway))
+
+ggplot(gsea_df, aes(x=NES, y=pathway, fill=direction)) +
+  geom_bar(stat="identity", width=0.75) +
+  geom_vline(xintercept=0, colour="grey30") +
+  scale_fill_manual(
+    values = c("Up in BRCA1"=COL_BRCA1, "Down in BRCA1"=COL_WT)
+  ) +
+  labs(title="Hallmark GSEA — BRCA1 vs WT",
+       x="Normalized Enrichment Score (NES)", y=NULL) +
+  theme_classic(base_size=12) +
+  theme(plot.title=element_text(face="bold", hjust=0.5))
+
+ggsave("figures/Figure2_GSEA_hallmark.png", width=9, height=5, dpi=300)
+```
+
+---
+
+## Step 10 — Save Supplementary Tables
+
+```{r save-tables}
+wb <- createWorkbook()
+
+addWorksheet(wb, "S1_DE_Full")
+writeData(wb, "S1_DE_Full", de_results)
+
+addWorksheet(wb, "S2_DE_Significant")
+writeData(wb, "S2_DE_Significant",
+          de_results %>% filter(padj < 0.05))
+
+addWorksheet(wb, "S3_Top25_Up")
+writeData(wb, "S3_Top25_Up",
+          de_results %>%
+            filter(padj<0.05, log2FoldChange>0) %>%
+            slice_max(log2FoldChange, n=25))
+
+addWorksheet(wb, "S4_Top25_Down")
+writeData(wb, "S4_Top25_Down",
+          de_results %>%
+            filter(padj<0.05, log2FoldChange<0) %>%
+            slice_min(log2FoldChange, n=25))
+
+saveWorkbook(wb, "supplementary/Tables_S1_S4_DE_Results.xlsx",
+             overwrite=TRUE)
+cat("✓ Supplementary Tables S1-S4 saved.\n")
+```
+
+---
+
+## Session Info
+
+```{r session}
+sessionInfo()
+```

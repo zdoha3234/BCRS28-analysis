@@ -1,0 +1,834 @@
+---
+title: "BCRS-28 | Script 2: Bulk RNA-seq Integration & Machine Learning"
+subtitle: "ComBat Batch Correction, SVM Model Development & Validation"
+author: "Zinab O. Doha"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center"
+)
+```
+
+---
+
+## Overview
+
+This script performs bulk RNA-seq integration and machine learning model
+development for BCRS-28, including:
+
+- Dataset download and processing (TCGA-BRCA, GSE183947, GSE58135)
+- Two-stage ComBat batch correction (training only → fixed transform to validation)
+- PCA quality control
+- Stepwise SVM feature selection across 7 ML classifiers
+- Fine-grained 28-gene optimal feature identification
+- Model performance evaluation (Figure 4, Figure 5)
+
+**Input:** Processed bulk RNA-seq RDS files, `signature_genes.xlsx`  
+**Output:** Figures 3–5, Supplementary Tables S5, S9
+
+---
+
+## Step 1 — Libraries
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(patchwork)
+  library(e1071)
+  library(randomForest)
+  library(gbm)
+  library(nnet)
+  library(rpart)
+  library(class)
+  library(pROC)
+  library(PRROC)
+  library(sva)
+  library(openxlsx)
+  library(tibble)
+  library(dcurves)
+})
+
+dir.create("figures/ML",    showWarnings=FALSE, recursive=TRUE)
+dir.create("supplementary", showWarnings=FALSE)
+set.seed(42)
+
+COL_TUMOR  <- "#E41A1C"
+COL_NORMAL <- "#2ABAB4"
+COL_ROC    <- "#4B0082"
+
+cat("Libraries loaded.\n")
+```
+
+---
+
+## Step 2 — Process Bulk RNA-seq Datasets
+
+### 2A — GSE183947
+
+```{r gse183947}
+# Download and process GSE183947 (30 tumor, 30 normal)
+# ── Instructions: download series matrix from GEO ─────────────────────────
+# URL: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE183947
+
+gse183 <- readRDS("data/processed/GSE183947_processed.rds")
+cat("GSE183947:", dim(gse183$expr), "\n")
+print(table(gse183$meta$tissue_type))
+```
+
+### 2B — TCGA-BRCA
+
+```{r tcga}
+# Download from UCSC Xena browser
+# URL: https://xenabrowser.net/datapages/?cohort=TCGA%20Breast%20Cancer%20(BRCA)
+
+tcga <- readRDS("data/processed/TCGA_BRCA_processed.rds")
+cat("TCGA-BRCA:", dim(tcga$expr), "\n")
+print(table(tcga$meta$tissue_type))
+```
+
+### 2C — GSE58135
+
+```{r gse58135}
+# Download from GEO
+# URL: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE58135
+
+gse581 <- readRDS("data/processed/GSE58135_processed.rds")
+cat("GSE58135:", dim(gse581$expr), "\n")
+print(table(gse581$meta$tissue_type))
+```
+
+---
+
+## Step 3 — Two-Stage ComBat Batch Correction
+
+> **Key methodological note:** ComBat parameters are estimated from  
+> training cohorts only (TCGA + GSE183947). GSE58135 receives a fixed  
+> transformation to preserve its independence as the validation cohort.
+
+```{r combat}
+library(sva)
+
+# ── Common genes across all 3 ──────────────────────────────────────────────
+common_genes <- Reduce(intersect, list(
+  rownames(tcga$expr),
+  rownames(gse581$expr),
+  rownames(gse183$expr)
+))
+cat("Common genes:", length(common_genes), "\n")
+
+tcga_mat  <- tcga$expr[common_genes,]
+gse581_mat <- gse581$expr[common_genes,]
+gse183_mat <- gse183$expr[common_genes,]
+
+# ── STAGE 1: Training data only (TCGA + GSE183947) ────────────────────────
+train_mat <- cbind(tcga_mat, gse183_mat)
+train_meta <- bind_rows(
+  tcga$meta  %>% dplyr::select(sample_id, tissue_type, dataset) %>%
+    mutate(OS_days=tcga$meta$OS_days, OS_event=tcga$meta$OS_event),
+  gse183$meta %>% dplyr::select(sample_id, tissue_type, dataset) %>%
+    mutate(OS_days=NA_real_, OS_event=NA_real_)
+)
+
+cat("\nTraining cohorts:\n")
+print(table(train_meta$tissue_type, train_meta$dataset))
+
+cat("\nEstimating ComBat parameters from training data only...\n")
+train_corrected <- ComBat(
+  dat       = train_mat,
+  batch     = train_meta$dataset,
+  mod       = model.matrix(~ tissue_type, data=train_meta),
+  par.prior = TRUE,
+  prior.plots = FALSE,
+  mean.only = FALSE
+)
+cat("Training ComBat complete.\n")
+
+# ── STAGE 2: Apply fixed parameters to GSE58135 ───────────────────────────
+gse581_meta <- gse581$meta %>%
+  dplyr::select(sample_id, tissue_type, dataset) %>%
+  mutate(OS_days=NA_real_, OS_event=NA_real_)
+
+all_mat  <- cbind(train_mat, gse581_mat)
+all_meta <- bind_rows(train_meta, gse581_meta)
+
+all_corrected <- ComBat(
+  dat       = all_mat,
+  batch     = all_meta$dataset,
+  mod       = model.matrix(~ tissue_type, data=all_meta),
+  par.prior = TRUE,
+  ref.batch = "TCGA",          # ← Training reference
+  prior.plots = FALSE
+)
+cat("Fixed transform applied to GSE58135.\n")
+
+# ── Split back ────────────────────────────────────────────────────────────
+train_samples <- train_meta$sample_id
+val_samples   <- gse581_meta$sample_id
+
+expr_train_corrected <- all_corrected[, train_samples]
+expr_val_corrected   <- all_corrected[, val_samples]
+
+cat("Training corrected:", dim(expr_train_corrected), "\n")
+cat("Validation corrected:", dim(expr_val_corrected), "\n")
+
+# Save
+saveRDS(list(expr=expr_train_corrected, metadata=train_meta,
+             common_genes=common_genes),
+        "data/integrated/bulk_train_integrated.rds")
+saveRDS(list(expr=expr_val_corrected, metadata=gse581_meta,
+             common_genes=common_genes),
+        "data/integrated/bulk_val_integrated.rds")
+cat("✓ Integration saved.\n")
+```
+
+---
+
+## Step 4 — PCA Quality Control
+
+```{r pca, fig.width=12, fig.height=10}
+plot_pca <- function(expr_mat, meta, title) {
+  gene_var <- apply(expr_mat, 1, var, na.rm=TRUE)
+  expr_mat <- expr_mat[gene_var>0 & !is.na(gene_var),]
+
+  pca    <- prcomp(t(expr_mat), scale.=TRUE, rank.=2)
+  pca_df <- as.data.frame(pca$x) %>%
+    rownames_to_column("sample_id") %>%
+    left_join(meta, by="sample_id")
+  pct <- round(100*pca$sdev^2/sum(pca$sdev^2), 1)
+
+  pal_ds <- c("TCGA"="#4DAF4A", "GSE183947"="#377EB8")
+
+  p1 <- ggplot(pca_df, aes(PC1,PC2, colour=dataset, shape=tissue_type)) +
+    geom_point(size=1.5, alpha=0.7) +
+    scale_colour_manual(values=pal_ds) +
+    labs(x=paste0("PC1 (",pct[1],"%)"), y=paste0("PC2 (",pct[2],"%)"),
+         title=paste0(title," — dataset")) +
+    theme_classic(base_size=12) +
+    theme(plot.title=element_text(face="bold", hjust=0.5),
+          legend.title=element_text(size=11, face="bold"),
+          legend.text=element_text(size=10))
+
+  p2 <- ggplot(pca_df, aes(PC1,PC2, colour=tissue_type)) +
+    geom_point(size=1.5, alpha=0.7) +
+    scale_colour_manual(values=c(Tumor=COL_TUMOR, Normal=COL_NORMAL)) +
+    labs(x=paste0("PC1 (",pct[1],"%)"), y=paste0("PC2 (",pct[2],"%)"),
+         title=paste0(title," — tissue")) +
+    theme_classic(base_size=12) +
+    theme(plot.title=element_text(face="bold", hjust=0.5),
+          legend.title=element_text(size=11, face="bold"),
+          legend.text=element_text(size=10))
+
+  p1 | p2
+}
+
+p_before <- plot_pca(train_mat,            train_meta, "Before ComBat")
+p_after  <- plot_pca(expr_train_corrected, train_meta, "After ComBat")
+
+pca_fig <- p_before / p_after +
+  plot_annotation(
+    title = "Batch Correction QC — Before vs After ComBat\n(Training: TCGA + GSE183947 only)",
+    theme = theme(plot.title=element_text(face="bold", hjust=0.5, size=13))
+  )
+
+pca_fig
+ggsave("figures/ML/Figure2_PCA_BatchCorrection.png",
+       pca_fig, width=12, height=10, dpi=300)
+cat("Figure 2 PCA saved.\n")
+```
+
+---
+
+## Step 5 — Build ML Feature Matrix
+
+```{r ml-matrix}
+sig_df <- read.xlsx("signature_genes.xlsx")
+signature_genes <- sig_df$gene
+
+bulk_train <- readRDS("data/integrated/bulk_train_integrated.rds")
+bulk_val   <- readRDS("data/integrated/bulk_val_integrated.rds")
+
+found_train <- intersect(signature_genes, rownames(bulk_train$expr))
+found_val   <- intersect(signature_genes, rownames(bulk_val$expr))
+cat("Genes in training:", length(found_train), "/ Validation:",
+    length(found_val), "\n")
+
+ml_train <- as.data.frame(t(bulk_train$expr[found_train,])) %>%
+  rownames_to_column("sample_id") %>%
+  left_join(bulk_train$metadata, by="sample_id") %>%
+  mutate(label=factor(ifelse(tissue_type=="Tumor",1,0),
+                      levels=c(0,1), labels=c("Normal","Tumor")))
+
+ml_val <- as.data.frame(t(bulk_val$expr[found_val,])) %>%
+  rownames_to_column("sample_id") %>%
+  left_join(bulk_val$metadata, by="sample_id") %>%
+  mutate(label=factor(ifelse(tissue_type=="Tumor",1,0),
+                      levels=c(0,1), labels=c("Normal","Tumor")))
+
+cat("Training:", nrow(ml_train), "| Validation:", nrow(ml_val), "\n")
+print(table(ml_train$label, ml_train$dataset))
+```
+
+---
+
+## Step 6 — Train / Test Split (80/20 Stratified)
+
+```{r split}
+stratified_split <- function(labels, idx, p=0.8) {
+  train <- c()
+  for (lev in levels(labels)) {
+    lev_idx <- idx[labels[idx]==lev]
+    n_train <- round(length(lev_idx)*p)
+    train   <- c(train, sample(lev_idx, n_train))
+  }
+  train
+}
+
+set.seed(42)
+all_idx   <- seq_len(nrow(ml_train))
+train_idx <- stratified_split(ml_train$label, all_idx, p=0.8)
+test_idx  <- setdiff(all_idx, train_idx)
+
+df_train <- ml_train[train_idx,]
+df_test  <- ml_train[test_idx,]
+df_val   <- ml_val
+
+X_train <- df_train[, found_train]
+y_train <- df_train$label
+X_test  <- df_test[,  found_train]
+y_test  <- df_test$label
+X_val   <- df_val[,   found_val]
+y_val   <- df_val$label
+
+cat("Train:", nrow(df_train), "| Test:", nrow(df_test),
+    "| Validation:", nrow(df_val), "\n")
+cat("Train tumor:normal =",
+    sum(y_train=="Tumor"), ":", sum(y_train=="Normal"), "\n")
+```
+
+---
+
+## Step 7 — 5-Fold Cross-Validation Functions
+
+```{r cv-functions}
+make_folds <- function(y, k=5) {
+  folds <- vector("list", k)
+  for (lev in levels(y)) {
+    idx  <- which(y==lev)
+    idx  <- sample(idx)
+    cuts <- cut(seq_along(idx), breaks=k, labels=FALSE)
+    for (i in 1:k)
+      folds[[i]] <- c(folds[[i]], idx[cuts==i])
+  }
+  folds
+}
+
+cv_auc <- function(X, y, model_fn, k=5) {
+  folds <- make_folds(y, k)
+  aucs  <- numeric(k)
+  for (i in 1:k) {
+    te_idx  <- folds[[i]]
+    tr_idx  <- setdiff(seq_len(nrow(X)), te_idx)
+    prob    <- model_fn(X[tr_idx,], y[tr_idx], X[te_idx,])
+    aucs[i] <- as.numeric(auc(roc(y[te_idx], prob, quiet=TRUE)))
+  }
+  mean(aucs, na.rm=TRUE)
+}
+
+# ── Model functions ─────────────────────────────────────────────────────────
+fn_rf   <- function(Xtr,ytr,Xte) {
+  predict(randomForest(x=Xtr,y=ytr,ntree=500),Xte,type="prob")[,"Tumor"]
+}
+fn_svm  <- function(Xtr,ytr,Xte) {
+  attr(predict(svm(x=Xtr,y=ytr,probability=TRUE,kernel="radial"),
+               Xte,probability=TRUE),"probabilities")[,"Tumor"]
+}
+fn_gbdt <- function(Xtr,ytr,Xte) {
+  df <- cbind(as.data.frame(Xtr),label=as.integer(ytr)-1)
+  m  <- gbm(label~.,data=df,distribution="bernoulli",
+             n.trees=100,interaction.depth=3,verbose=FALSE)
+  predict(m,as.data.frame(Xte),n.trees=100,type="response")
+}
+fn_dt   <- function(Xtr,ytr,Xte) {
+  df <- cbind(as.data.frame(Xtr),label=ytr)
+  predict(rpart(label~.,data=df,method="class"),
+          as.data.frame(Xte),type="prob")[,"Tumor"]
+}
+fn_knn  <- function(Xtr,ytr,Xte,k=5) {
+  pred <- knn(Xtr,Xte,ytr,k=k,prob=TRUE)
+  prob <- attr(pred,"prob")
+  ifelse(pred=="Tumor",prob,1-prob)
+}
+fn_mlp  <- function(Xtr,ytr,Xte) {
+  df <- cbind(as.data.frame(Xtr),label=as.integer(ytr)-1)
+  m  <- nnet(label~.,data=df,size=5,maxit=200,trace=FALSE,linout=FALSE)
+  as.numeric(predict(m,as.data.frame(Xte)))
+}
+fn_lr   <- function(Xtr,ytr,Xte) {
+  df <- cbind(as.data.frame(Xtr),label=as.integer(ytr)-1)
+  predict(glm(label~.,data=df,family=binomial),
+          as.data.frame(Xte),type="response")
+}
+
+model_fns <- list(RF=fn_rf,KNN=fn_knn,SVM=fn_svm,
+                  GBDT=fn_gbdt,DT=fn_dt,MLP=fn_mlp,LR=fn_lr)
+cat("Model functions ready.\n")
+```
+
+---
+
+## Step 8 — Stepwise Model Comparison (Figure 3A–C)
+
+```{r stepwise, cache=TRUE}
+ordered_genes <- sig_df %>%
+  arrange(desc(abs(avg_log2FC))) %>%
+  filter(gene %in% found_train) %>%
+  pull(gene) %>% unique()
+
+n_steps      <- seq(5, min(45, length(ordered_genes)), by=5)
+results_list <- list()
+
+for (n in n_steps) {
+  cat("n =", n, "genes |")
+  genes <- ordered_genes[1:n]
+  Xtr   <- X_train[, genes, drop=FALSE]
+  Xte   <- X_test[,  genes, drop=FALSE]
+  row   <- data.frame(n_genes=n)
+
+  for (nm in names(model_fns)) {
+    tryCatch({
+      set.seed(42)
+      cv   <- cv_auc(Xtr, y_train, model_fns[[nm]], k=5)
+      prob <- model_fns[[nm]](Xtr, y_train, Xte)
+      r    <- roc(y_test, prob, quiet=TRUE)
+      row[[paste0(nm,"_CV_AUC")]] <- round(cv,4)
+      row[[paste0(nm,"_AUC")]]    <- round(as.numeric(auc(r)),4)
+      row[[paste0(nm,"_Sens")]]   <- round(coords(r,"best",ret="sensitivity")[[1]],4)
+      row[[paste0(nm,"_Spec")]]   <- round(coords(r,"best",ret="specificity")[[1]],4)
+      cat(nm, round(as.numeric(auc(r)),3), "|")
+    }, error=function(e) {
+      row[[paste0(nm,"_AUC")]] <<- NA
+    })
+  }
+  cat("\n")
+  results_list[[as.character(n)]] <- row
+}
+
+results_df <- bind_rows(results_list)
+write.csv(results_df, "supplementary/TableS5_ML_Comparison.csv",
+          row.names=FALSE)
+cat("✓ Table S5 saved.\n")
+print(results_df[,c("n_genes",paste0(names(model_fns),"_AUC"))])
+```
+
+### Figure 3A–C
+
+```{r fig3abc, fig.width=15, fig.height=5}
+pal_model <- c(RF="#E41A1C",KNN="#377EB8",SVM="#FF7F00",
+               GBDT="#4DAF4A",DT="#984EA3",MLP="#A65628",LR="#999999")
+
+make_line_plot <- function(df, y_col, y_lab, y_lim=c(0.4,1)) {
+  ggplot(df, aes(x=n_genes, y=.data[[y_col]],
+                  colour=model, group=model)) +
+    geom_line(linewidth=0.9) + geom_point(size=2.2) +
+    scale_colour_manual(values=pal_model) +
+    scale_x_continuous(breaks=unique(df$n_genes)) +
+    scale_y_continuous(limits=y_lim) +
+    labs(x="Number of genes", y=y_lab, colour=NULL) +
+    theme_classic(base_size=11) +
+    theme(legend.position="right")
+}
+
+auc_long  <- results_df %>%
+  dplyr::select(n_genes, ends_with("_AUC"),
+                -ends_with("_CV_AUC")) %>%
+  pivot_longer(-n_genes, names_to="model", values_to="AUC") %>%
+  mutate(model=gsub("_AUC","",model))
+
+sens_long <- results_df %>%
+  dplyr::select(n_genes, ends_with("_Sens")) %>%
+  pivot_longer(-n_genes, names_to="model", values_to="Sensitivity") %>%
+  mutate(model=gsub("_Sens","",model))
+
+spec_long <- results_df %>%
+  dplyr::select(n_genes, ends_with("_Spec")) %>%
+  pivot_longer(-n_genes, names_to="model", values_to="Specificity") %>%
+  mutate(model=gsub("_Spec","",model))
+
+p3A <- make_line_plot(auc_long,  "AUC",         "AUC")
+p3B <- make_line_plot(sens_long, "Sensitivity",  "Sensitivity", c(0,1))
+p3C <- make_line_plot(spec_long, "Specificity",  "Specificity", c(0,1))
+
+fig3abc <- (p3A|p3B|p3C) +
+  plot_annotation(title="Figure 3A–C · Model Performance Across Feature Numbers",
+                  theme=theme(plot.title=element_text(face="bold",hjust=0.5)))
+fig3abc
+
+ggsave("figures/ML/Figure3ABC_model_comparison.png",
+       fig3abc, width=15, height=5, dpi=300)
+cat("Figure 3A–C saved.\n")
+```
+
+---
+
+## Step 9 — Fine-Grained SVM Optimization (Figure 3D–F)
+
+```{r fine-svm, cache=TRUE}
+fine_results <- list()
+
+for (n in 1:length(ordered_genes)) {
+  genes <- ordered_genes[1:n]
+  genes <- genes[genes %in% colnames(X_train)]
+  Xtr   <- X_train[, genes, drop=FALSE]
+  Xte   <- X_test[,  genes, drop=FALSE]
+
+  set.seed(42)
+  tryCatch({
+    m  <- svm(x=Xtr, y=y_train, probability=TRUE, kernel="radial")
+    p  <- attr(predict(m, Xte, probability=TRUE),
+                "probabilities")[,"Tumor"]
+    r  <- roc(y_test, p, quiet=TRUE)
+    cv <- cv_auc(Xtr, y_train, fn_svm, k=5)
+
+    fine_results[[n]] <- data.frame(
+      n_genes    = n,
+      gene_added = genes[n],
+      CV_AUC     = round(cv, 4),
+      AUC        = round(as.numeric(auc(r)), 4),
+      Sens       = round(coords(r,"best",ret="sensitivity")[[1]], 4),
+      Spec       = round(coords(r,"best",ret="specificity")[[1]], 4)
+    )
+    if (n %% 5 == 0)
+      cat("n=", n, "| AUC:", round(as.numeric(auc(r)),3), "\n")
+  }, error=function(e) cat("n=", n, "failed\n"))
+}
+
+fine_svm_df   <- bind_rows(fine_results)
+best_n        <- fine_svm_df$n_genes[which.max(fine_svm_df$AUC)]
+optimal_genes <- ordered_genes[1:best_n]
+
+cat("\n=== Optimal SVM ===\n")
+cat("Optimal n:", best_n, "\n")
+cat("Best AUC: ", max(fine_svm_df$AUC), "\n")
+cat("Genes:    ", paste(optimal_genes, collapse=", "), "\n")
+
+write.csv(fine_svm_df, "supplementary/TableS5_SVM_fine.csv",
+          row.names=FALSE)
+```
+
+### Figure 3D–F
+
+```{r fig3def, fig.width=14, fig.height=4}
+make_svm_plot <- function(y_col, y_lab, title) {
+  ggplot(fine_svm_df, aes_string(x="n_genes", y=y_col)) +
+    geom_line(colour="#FF7F00", linewidth=1.1) +
+    geom_point(colour="#FF7F00", size=2.5) +
+    geom_vline(xintercept=best_n, linetype="dashed", colour="grey40") +
+    annotate("text", x=best_n+1, y=min(fine_svm_df[[y_col]]),
+             label=paste0("n=",best_n), hjust=0, size=3.5) +
+    scale_x_continuous(breaks=seq(1,45,2)) +
+    labs(x="Number of genes", y=y_lab, title=title) +
+    theme_classic(base_size=11) +
+    theme(plot.title=element_text(face="bold"))
+}
+
+fig3def <- (make_svm_plot("AUC","AUC","D  SVM — AUC") |
+            make_svm_plot("Sens","Sensitivity","E  SVM — Sensitivity") |
+            make_svm_plot("Spec","Specificity","F  SVM — Specificity"))
+
+fig3def
+ggsave("figures/ML/Figure3DEF_SVM_optimal.png",
+       fig3def, width=14, height=4, dpi=300)
+cat("Figure 3D–F saved.\n")
+```
+
+---
+
+## Step 10 — Train Final BCRS-28 SVM Model
+
+```{r final-model}
+# BCRS-28: 28 optimal genes
+BCRS28_genes <- c(
+  "GADD45G",
+  "CRIP1",   "SNCG",    "PIP",
+  "KRT14",   "KRT15",   "MUCL1",   "SERHL2",
+  "ANGPTL4", "BAMBI",   "CD14",    "CXCL14",
+  "KLK7",    "KLK5",    "RARRES1", "SLC40A1", "FABP3",
+  "TGM2",    "HMOX1",   "SCGB3A1", "SERPINA5","FASN",
+  "WNT4",    "LMO7",    "CCL20",   "EEF1A2",  "CCDC74A", "GBP1"
+)
+cat("BCRS-28 genes:", length(BCRS28_genes), "\n")
+
+X_train_opt <- X_train[, BCRS28_genes[BCRS28_genes %in% colnames(X_train)]]
+X_test_opt  <- X_test[,  BCRS28_genes[BCRS28_genes %in% colnames(X_test)]]
+X_val_opt   <- X_val[,   BCRS28_genes[BCRS28_genes %in% colnames(X_val)]]
+
+set.seed(42)
+final_svm <- svm(x=X_train_opt, y=y_train,
+                 probability=TRUE, kernel="radial",
+                 cost=1, gamma=1/ncol(X_train_opt))
+
+# Predictions
+pred_train_prob  <- attr(predict(final_svm,X_train_opt,probability=TRUE),
+                          "probabilities")[,"Tumor"]
+pred_test_prob   <- attr(predict(final_svm,X_test_opt, probability=TRUE),
+                          "probabilities")[,"Tumor"]
+pred_val_prob    <- attr(predict(final_svm,X_val_opt,  probability=TRUE),
+                          "probabilities")[,"Tumor"]
+
+pred_train_class <- predict(final_svm, X_train_opt)
+pred_test_class  <- predict(final_svm, X_test_opt)
+pred_val_class   <- predict(final_svm, X_val_opt)
+
+roc_train <- roc(y_train, pred_train_prob, quiet=TRUE)
+roc_test  <- roc(y_test,  pred_test_prob,  quiet=TRUE)
+roc_val   <- roc(y_val,   pred_val_prob,   quiet=TRUE)
+
+# ── Comprehensive metrics (including imbalance-appropriate) ─────────────
+get_metrics <- function(roc_obj, y_true, y_prob, y_pred) {
+  best <- coords(roc_obj,"best",
+                 ret=c("threshold","sensitivity","specificity"))
+  cm   <- table(Predicted=y_pred, Actual=y_true)
+  TP   <- as.double(cm["Tumor","Tumor"])
+  TN   <- as.double(cm["Normal","Normal"])
+  FP   <- as.double(cm["Tumor","Normal"])
+  FN   <- as.double(cm["Normal","Tumor"])
+  acc  <- (TP+TN)/(TP+TN+FP+FN)
+  bal  <- (best$sensitivity + best$specificity)/2
+  prec <- TP/(TP+FP)
+  f1   <- 2*TP/(2*TP+FP+FN)
+  mcc  <- (TP*TN-FP*FN)/sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN))
+  pr   <- pr.curve(scores.class0=y_prob[y_true=="Tumor"],
+                   scores.class1=y_prob[y_true=="Normal"])
+
+  data.frame(
+    AUC               = round(as.numeric(auc(roc_obj)),3),
+    Accuracy          = round(acc,3),
+    Balanced_Accuracy = round(bal,3),
+    Sensitivity       = round(best$sensitivity,3),
+    Specificity       = round(best$specificity,3),
+    Precision         = round(prec,3),
+    F1                = round(f1,3),
+    AUPRC             = round(pr$auc.integral,3),
+    MCC               = round(mcc,3)
+  )
+}
+
+perf <- bind_rows(
+  get_metrics(roc_train,y_train,pred_train_prob,pred_train_class) %>%
+    mutate(Cohort="Training (TCGA+GSE183947)"),
+  get_metrics(roc_test, y_test, pred_test_prob, pred_test_class) %>%
+    mutate(Cohort="Test (20% holdout)"),
+  get_metrics(roc_val,  y_val,  pred_val_prob,  pred_val_class) %>%
+    mutate(Cohort="Independent Validation (GSE58135)")
+) %>% dplyr::select(Cohort, everything())
+
+cat("\n=== BCRS-28 Performance ===\n")
+print(perf)
+
+# Save model and predictions
+saveRDS(final_svm, "data/integrated/final_SVM_model_BCRS28.rds")
+saveRDS(list(
+  train = list(prob=pred_train_prob, class=pred_train_class,
+               true=y_train, roc=roc_train),
+  test  = list(prob=pred_test_prob,  class=pred_test_class,
+               true=y_test,  roc=roc_test),
+  val   = list(prob=pred_val_prob,   class=pred_val_class,
+               true=y_val,   roc=roc_val)
+), "data/integrated/predictions_BCRS28.rds")
+cat("✓ Model and predictions saved.\n")
+```
+
+---
+
+## Step 11 — Figure 4: Model Performance
+
+```{r fig4, fig.width=15, fig.height=25}
+preds <- readRDS("data/integrated/predictions_BCRS28.rds")
+
+# ── Score distribution plots (A-C) ─────────────────────────────────────────
+make_score_plot <- function(prob, true, title) {
+  df <- data.frame(score=prob, label=true)
+  wt <- wilcox.test(score~label, data=df)
+  plab <- ifelse(wt$p.value<0.001,"***",ifelse(wt$p.value<0.01,"**","*"))
+
+  ggplot(df, aes(x=label, y=score, colour=label)) +
+    geom_boxplot(outlier.shape=NA, width=0.4) +
+    geom_jitter(width=0.15, size=0.8, alpha=0.6) +
+    geom_hline(yintercept=0.5, linetype="dashed", colour="grey40") +
+    annotate("text", x=1.5, y=1.05, label=plab, size=6) +
+    annotate("segment", x=1, xend=2, y=1.02, yend=1.02) +
+    scale_colour_manual(values=c(Normal=COL_NORMAL, Tumor=COL_TUMOR)) +
+    scale_y_continuous(limits=c(0,1.1)) +
+    labs(title=title, x=NULL, y="BCRS_score") +
+    theme_classic(base_size=11) +
+    theme(plot.title=element_text(face="bold",hjust=0.5),
+          legend.position="none")
+}
+
+pA <- make_score_plot(preds$train$prob, preds$train$true, "A  Train")
+pB <- make_score_plot(preds$test$prob,  preds$test$true,  "B  Test")
+pC <- make_score_plot(preds$val$prob,   preds$val$true,
+                      "C  Validation (GSE58135)")
+
+# ── ROC curves (G-I) ────────────────────────────────────────────────────────
+make_roc_plot <- function(roc_obj, title) {
+  roc_df <- data.frame(spec=1-roc_obj$specificities,
+                       sens=roc_obj$sensitivities)
+  ggplot(roc_df, aes(x=spec, y=sens)) +
+    geom_line(colour=COL_ROC, linewidth=1.2) +
+    geom_abline(linetype="dashed", colour="grey60") +
+    annotate("text", x=0.75, y=0.1,
+             label=paste0("AUC = ",round(as.numeric(auc(roc_obj)),3)),
+             size=4, fontface="bold", colour=COL_ROC) +
+    labs(title=title, x="1-specificity", y="sensitivity") +
+    theme_classic(base_size=11) +
+    theme(plot.title=element_text(face="bold",hjust=0.5))
+}
+
+pG <- make_roc_plot(preds$train$roc, "G  Train")
+pH <- make_roc_plot(preds$test$roc,  "H  Test")
+pI <- make_roc_plot(preds$val$roc,   "I  Validation (GSE58135)")
+
+# ── PR curves (M-O) ────────────────────────────────────────────────────────
+make_pr_plot <- function(prob, true, title) {
+  pr    <- pr.curve(scores.class0=prob[true=="Tumor"],
+                    scores.class1=prob[true=="Normal"], curve=TRUE)
+  pr_df <- as.data.frame(pr$curve)
+  colnames(pr_df) <- c("recall","precision","threshold")
+
+  ggplot(pr_df, aes(x=recall, y=precision)) +
+    geom_area(fill=COL_ROC, alpha=0.2) +
+    geom_line(colour=COL_ROC, linewidth=1.1) +
+    annotate("text", x=0.25, y=0.15,
+             label=paste0("AUPRC = ",round(pr$auc.integral,3)),
+             size=4, fontface="bold", colour=COL_ROC) +
+    labs(title=title, x="Recall", y="Precision") +
+    theme_classic(base_size=11) +
+    theme(plot.title=element_text(face="bold",hjust=0.5))
+}
+
+pM <- make_pr_plot(preds$train$prob, preds$train$true, "M  PR — Train")
+pN <- make_pr_plot(preds$test$prob,  preds$test$true,  "N  PR — Test")
+pO <- make_pr_plot(preds$val$prob,   preds$val$true,
+                   "O  PR — Validation")
+
+# Assemble
+fig4 <- (pA|pB|pC) / (pG|pH|pI) / (pM|pN|pO) +
+  plot_annotation(
+    title = "BCRS-28 Cancer Risk Model Performance\nTrain | Test | Independent Validation (GSE58135)",
+    theme = theme(plot.title=element_text(face="bold",hjust=0.5,size=13))
+  )
+
+fig4
+ggsave("figures/ML/Figure4_BCRS28_Performance.png",
+       fig4, width=15, height=18, dpi=300)
+cat("Figure 4 saved.\n")
+```
+
+---
+
+## Step 12 — Figure 5: Performance Summary & DCA
+
+```{r fig5, fig.width=14, fig.height=5}
+# ── Panel A: Heatmap ────────────────────────────────────────────────────────
+perf_long <- perf %>%
+  pivot_longer(-Cohort, names_to="Metric", values_to="Score") %>%
+  mutate(
+    Cohort = factor(Cohort, levels=c("Training (TCGA+GSE183947)",
+                                      "Test (20% holdout)",
+                                      "Independent Validation (GSE58135)")),
+    Set    = case_when(
+      grepl("Training",  Cohort) ~ "Train",
+      grepl("Test",      Cohort) ~ "Test",
+      grepl("Validation",Cohort) ~ "Validation"
+    ),
+    Set = factor(Set, levels=c("Train","Test","Validation"))
+  )
+
+p5A <- ggplot(perf_long %>% filter(Metric %in%
+                c("AUC","Accuracy","Sensitivity","Specificity","F1")),
+              aes(x=Metric, y=Set, fill=Score)) +
+  geom_tile(colour="white", linewidth=0.5) +
+  geom_text(aes(label=round(Score,3)), fontface="bold", size=6) +
+  scale_fill_gradient2(low="#2ABAB4", mid="#FF9999", high="#CC0000",
+                        midpoint=0.9, limits=c(0.7,1), name="Score") +
+  labs(title="BCRS-28 Performance Summary", x=NULL, y=NULL) +
+  theme_classic(base_size=16) +
+  theme(plot.title   = element_text(face="bold",hjust=0.5,size=18),
+        axis.text.x  = element_text(angle=30,hjust=1,size=14),
+        axis.text.y  = element_text(size=14,face="bold"),
+        legend.position="right")
+
+# ── Panel B: DCA ────────────────────────────────────────────────────────────
+dca_df <- data.frame(
+  label = as.integer(preds$test$true=="Tumor"),
+  bcrs  = preds$test$prob
+)
+dca_res <- dca(label~bcrs, data=dca_df,
+               thresholds=seq(0,1,by=0.01))
+p5B <- plot(dca_res, smooth=TRUE) +
+  scale_color_manual(
+    values = c(bcrs="#4B0082", All="#E41A1C", None="#2AA13C"),
+    labels = c(bcrs="BCRS-28", All="Treat All", None="Treat None")
+  ) +
+  labs(title="Decision Curve Analysis — BCRS-28 (Test Set)",
+       x="Threshold Probability", y="Net Benefit", color=NULL) +
+  scale_x_continuous(labels=scales::percent) +
+  theme_classic(base_size=12) +
+  theme(plot.title=element_text(face="bold",hjust=0.5))
+
+fig5 <- p5A | p5B
+fig5
+
+ggsave("figures/ML/Figure5_Summary_DCA.png",
+       fig5, width=14, height=5, dpi=300)
+cat("Figure 5 saved.\n")
+```
+
+---
+
+## Step 13 — Save Supplementary Table S9
+
+```{r table-s9}
+n_train_tumor  <- sum(y_train=="Tumor")
+n_train_normal <- sum(y_train=="Normal")
+n_test_tumor   <- sum(y_test=="Tumor")
+n_test_normal  <- sum(y_test=="Normal")
+n_val_tumor    <- sum(y_val=="Tumor")
+n_val_normal   <- sum(y_val=="Normal")
+
+s9 <- perf %>%
+  mutate(
+    N_Tumor  = c(n_train_tumor, n_test_tumor, n_val_tumor),
+    N_Normal = c(n_train_normal,n_test_normal,n_val_normal)
+  ) %>%
+  dplyr::select(Cohort, N_Tumor, N_Normal, everything())
+
+write.csv(s9, "supplementary/TableS9_BCRS28_Performance.csv",
+          row.names=FALSE)
+cat("✓ Table S9 saved.\n")
+print(s9)
+```
+
+---
+
+## Session Info
+
+```{r session}
+sessionInfo()
+```
