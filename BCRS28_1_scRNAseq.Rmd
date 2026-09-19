@@ -2,7 +2,7 @@
 title: "BCRS-28 | Script 1: scRNA-seq Analysis"
 subtitle: "Cell Annotation, Differential Expression & Pathway Enrichment"
 author: "Zinab O. Doha"
-date: "`r Sys.Date()`"
+date: "03/05/2026"
 output:
   html_document:
     toc: true
